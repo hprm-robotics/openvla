@@ -11,6 +11,12 @@ from typing import Any, Dict, List, Optional
 
 from torch.utils.data import IterableDataset
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 
 def normalize_instruction(instr):
     """
@@ -142,7 +148,38 @@ class AugmentedRLDSDataset(IterableDataset):
         # Statistics for logging
         self.episode_count = 0
         self.augmented_episode_count = 0
+        self.total_variants = 0
+        self.instructions_with_rephrases = 0
         self.log_interval = 100  # Log every 100 original episodes
+        self.wandb_log_interval = 100  # Log to wandb every 500 original episodes
+    
+    def log_augmentation_summary(self):
+        """Log a comprehensive summary of augmentation statistics."""
+        if self.episode_count == 0:
+            return
+            
+        avg_augmentation = self.total_variants / self.episode_count
+        rephrase_coverage = (self.instructions_with_rephrases / self.episode_count) * 100
+        
+        print(f"\n" + "="*60)
+        print(f"INSTRUCTION AUGMENTATION SUMMARY")
+        print(f"="*60)
+        print(f"Original episodes processed: {self.episode_count:,}")
+        print(f"Total training samples created: {self.total_variants:,}")
+        print(f"Average augmentation factor: {avg_augmentation:.2f}x")
+        print(f"Instructions with rephrases: {self.instructions_with_rephrases:,} ({rephrase_coverage:.1f}%)")
+        print(f"Data expansion: {((self.total_variants / self.episode_count) - 1) * 100:.1f}% more training data")
+        print(f"="*60 + "\n")
+        
+        # Log final summary to wandb
+        if WANDB_AVAILABLE:
+            wandb.log({
+                "augmentation_summary/total_original_episodes": self.episode_count,
+                "augmentation_summary/total_training_samples": self.total_variants,
+                "augmentation_summary/final_augmentation_factor": avg_augmentation,
+                "augmentation_summary/final_rephrase_coverage": rephrase_coverage,
+                "augmentation_summary/data_expansion_percent": ((avg_augmentation - 1) * 100)
+            })
     
     def __iter__(self):
         """Iterate over the dataset with instruction augmentation."""
@@ -156,12 +193,32 @@ class AugmentedRLDSDataset(IterableDataset):
                 # Get all instruction variants
                 instruction_variants = self.instruction_augmenter.get_all_instruction_variants(original_instruction)
                 
+                # Update statistics
+                self.total_variants += len(instruction_variants)
+                if len(instruction_variants) > 1:  # More than just the original
+                    self.instructions_with_rephrases += 1
+                
                 # Log augmentation info periodically
                 if self.episode_count % self.log_interval == 0:
-                    avg_augmentation = self.augmented_episode_count / self.episode_count if self.episode_count > 0 else 0
+                    avg_augmentation = self.total_variants / self.episode_count if self.episode_count > 0 else 0
+                    rephrase_coverage = (self.instructions_with_rephrases / self.episode_count) * 100
                     print(f"[Augmentation] Episode {self.episode_count}: "
                           f"'{original_instruction[:50]}...' -> {len(instruction_variants)} variants "
-                          f"(avg {avg_augmentation:.1f}x augmentation)")
+                          f"(avg {avg_augmentation:.1f}x, {rephrase_coverage:.1f}% have rephrases)")
+                
+                # Log to wandb periodically
+                if WANDB_AVAILABLE and self.episode_count % self.wandb_log_interval == 0:
+                    avg_augmentation = self.total_variants / self.episode_count
+                    rephrase_coverage = (self.instructions_with_rephrases / self.episode_count) * 100
+                    
+                    wandb.log({
+                        "augmentation/episodes_processed": self.episode_count,
+                        "augmentation/total_training_samples": self.total_variants,
+                        "augmentation/avg_augmentation_factor": avg_augmentation,
+                        "augmentation/rephrase_coverage_percent": rephrase_coverage,
+                        "augmentation/instructions_with_rephrases": self.instructions_with_rephrases,
+                        "augmentation/current_variants": len(instruction_variants)
+                    })
                 
                 # Yield one batch for each instruction variant
                 for i, variant in enumerate(instruction_variants):
@@ -180,6 +237,7 @@ class AugmentedRLDSDataset(IterableDataset):
             else:
                 # No augmentation, yield original batch
                 self.augmented_episode_count += 1
+                self.total_variants += 1  # Count original as 1 variant
                 yield batch
 
 
