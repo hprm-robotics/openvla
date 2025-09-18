@@ -138,10 +138,17 @@ class AugmentedRLDSDataset(IterableDataset):
         self.base_dataset = base_dataset
         self.instruction_augmenter = instruction_augmenter
         self.dataset_statistics = base_dataset.dataset_statistics
+        
+        # Statistics for logging
+        self.episode_count = 0
+        self.augmented_episode_count = 0
+        self.log_interval = 100  # Log every 100 original episodes
     
     def __iter__(self):
         """Iterate over the dataset with instruction augmentation."""
         for batch in self.base_dataset:
+            self.episode_count += 1
+            
             if self.instruction_augmenter and "task" in batch and "language_instruction" in batch["task"]:
                 # Decode the original instruction
                 original_instruction = batch["task"]["language_instruction"].decode()
@@ -149,15 +156,30 @@ class AugmentedRLDSDataset(IterableDataset):
                 # Get all instruction variants
                 instruction_variants = self.instruction_augmenter.get_all_instruction_variants(original_instruction)
                 
+                # Log augmentation info periodically
+                if self.episode_count % self.log_interval == 0:
+                    avg_augmentation = self.augmented_episode_count / self.episode_count if self.episode_count > 0 else 0
+                    print(f"[Augmentation] Episode {self.episode_count}: "
+                          f"'{original_instruction[:50]}...' -> {len(instruction_variants)} variants "
+                          f"(avg {avg_augmentation:.1f}x augmentation)")
+                
                 # Yield one batch for each instruction variant
-                for variant in instruction_variants:
+                for i, variant in enumerate(instruction_variants):
                     # Create a copy of the batch with the variant instruction
                     augmented_batch = batch.copy()
                     augmented_batch["task"] = batch["task"].copy()
                     augmented_batch["task"]["language_instruction"] = variant.encode()
+                    
+                    self.augmented_episode_count += 1
+                    
+                    # Log first few variants for verification
+                    if self.episode_count <= 5:
+                        print(f"  Variant {i+1}/{len(instruction_variants)}: '{variant}'")
+                    
                     yield augmented_batch
             else:
                 # No augmentation, yield original batch
+                self.augmented_episode_count += 1
                 yield batch
 
 
