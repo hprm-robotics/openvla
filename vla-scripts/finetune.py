@@ -225,38 +225,36 @@ def finetune(cfg: FinetuneConfig) -> None:
         print(f"Using instruction augmentation with mapping file: {cfg.instruction_mapping_file}")
         print(f"Maximum rephrases per instruction: {cfg.max_rephrases}")
     
-    # Create batch transform (same for both augmented and non-augmented)
-    if instruction_augmenter:
-        batch_transform = AugmentedRLDSBatchTransform(
-            action_tokenizer=action_tokenizer,
-            base_tokenizer=processor.tokenizer,
-            image_transform=processor.image_processor.apply_transform,
-            prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-        )
-    else:
-        batch_transform = RLDSBatchTransform(
-            action_tokenizer,
-            processor.tokenizer,
-            image_transform=processor.image_processor.apply_transform,
-            prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-        )
-    
-    # Create base dataset
-    base_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
+    # Create batch transform
+    batch_transform = RLDSBatchTransform(
+        action_tokenizer,
+        processor.tokenizer,
+        image_transform=processor.image_processor.apply_transform,
+        prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
     )
     
-    # Wrap with augmented dataset if instruction augmenter is provided
+    # Create dataset with or without augmentation
     if instruction_augmenter:
-        vla_dataset = AugmentedRLDSDataset(base_dataset, instruction_augmenter)
+        vla_dataset = AugmentedRLDSDataset(
+            data_root_dir=cfg.data_root_dir,
+            data_mix=cfg.dataset_name,
+            batch_transform=batch_transform,
+            instruction_augmenter=instruction_augmenter,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            train=True,
+            image_aug=cfg.image_aug,
+        )
         print(f"Dataset will be augmented - each episode will be replicated up to {cfg.max_rephrases + 1} times")
     else:
-        vla_dataset = base_dataset
+        vla_dataset = RLDSDataset(
+            cfg.data_root_dir,
+            cfg.dataset_name,
+            batch_transform,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            image_aug=cfg.image_aug,
+        )
 
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     if distributed_state.is_main_process:

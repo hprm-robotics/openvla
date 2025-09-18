@@ -50,6 +50,7 @@ class InstructionAugmenter:
         """
         self.instruction_mapping = {}
         self.max_rephrases = max_rephrases
+        self.debug_call_count = 0  # Track calls for debug limiting
         
         if instruction_mapping_file:
             self.load_instruction_mapping(instruction_mapping_file)
@@ -93,12 +94,19 @@ class InstructionAugmenter:
         Returns:
             List of all instruction variants (original + rephrases)
         """
+        self.debug_call_count += 1
+        show_debug = self.debug_call_count <= 5  # Only show debug for first 5 calls
+        
         if not self.instruction_mapping:
+            if show_debug:
+                print(f"[DEBUG] No instruction mapping available")
             return [original_instruction]
             
         # Normalize the instruction for lookup
         normalized_instruction = normalize_instruction(original_instruction)
         if normalized_instruction is None:
+            if show_debug:
+                print(f"[DEBUG] Instruction normalization failed for: '{original_instruction}'")
             return [original_instruction]
         
         # Start with the original instruction (normalized)
@@ -108,6 +116,11 @@ class InstructionAugmenter:
         if normalized_instruction in self.instruction_mapping:
             rephrases = self.instruction_mapping[normalized_instruction]
             variants.extend(rephrases)
+            if show_debug:
+                print(f"[DEBUG] Found {len(rephrases)} rephrases for '{normalized_instruction}'")
+        else:
+            if show_debug:
+                print(f"[DEBUG] No rephrases found for '{normalized_instruction}'")
         
         return variants
     
@@ -129,29 +142,51 @@ class InstructionAugmenter:
 class AugmentedRLDSDataset(IterableDataset):
     """
     Wrapper around RLDSDataset that replicates episodes for each instruction variant.
-    This creates multiple training samples from each episode - one for each instruction rephrase.
+    This intercepts the raw RLDS data before batch transformation.
     """
     
-    def __init__(self, base_dataset, instruction_augmenter: Optional[InstructionAugmenter] = None):
+    def __init__(self, data_root_dir, data_mix, batch_transform, instruction_augmenter, 
+                 resize_resolution, shuffle_buffer_size=256_000, train=True, image_aug=False):
         """
-        Initialize the augmented dataset.
+        Initialize the augmented RLDS dataset.
         
         Args:
-            base_dataset: The base RLDSDataset instance
-            instruction_augmenter: Optional instruction augmenter for episode replication
+            data_root_dir: Path to RLDS data
+            data_mix: Dataset mixture name
+            batch_transform: Batch transformation function
+            instruction_augmenter: Instruction augmenter instance
+            resize_resolution: Image resize resolution
+            shuffle_buffer_size: Shuffle buffer size
+            train: Whether training mode
+            image_aug: Whether to use image augmentation
         """
         super().__init__()
-        self.base_dataset = base_dataset
+        
+        # Import here to avoid circular imports
+        from prismatic.vla.datasets import RLDSDataset
+        
+        # Create base dataset but we'll intercept its iteration
+        self.base_dataset = RLDSDataset(
+            data_root_dir=data_root_dir,
+            data_mix=data_mix, 
+            batch_transform=batch_transform,
+            resize_resolution=resize_resolution,
+            shuffle_buffer_size=shuffle_buffer_size,
+            train=train,
+            image_aug=image_aug
+        )
+        
         self.instruction_augmenter = instruction_augmenter
-        self.dataset_statistics = base_dataset.dataset_statistics
+        self.dataset_statistics = self.base_dataset.dataset_statistics
         
         # Statistics for logging
         self.episode_count = 0
         self.augmented_episode_count = 0
         self.total_variants = 0
         self.instructions_with_rephrases = 0
+        self.skipped_empty_instructions = 0
         self.log_interval = 100  # Log every 100 original episodes
-        self.wandb_log_interval = 100  # Log to wandb every 500 original episodes
+        self.wandb_log_interval = 100  # Log to wandb every 100 original episodes
     
     def log_augmentation_summary(self):
         """Log a comprehensive summary of augmentation statistics."""
@@ -164,17 +199,22 @@ class AugmentedRLDSDataset(IterableDataset):
         print(f"\n" + "="*60)
         print(f"INSTRUCTION AUGMENTATION SUMMARY")
         print(f"="*60)
-        print(f"Original episodes processed: {self.episode_count:,}")
+        processed_episodes = self.episode_count - self.skipped_empty_instructions
+        print(f"Total episodes encountered: {self.episode_count:,}")
+        print(f"Episodes with empty instructions (skipped): {self.skipped_empty_instructions:,}")
+        print(f"Episodes processed: {processed_episodes:,}")
         print(f"Total training samples created: {self.total_variants:,}")
         print(f"Average augmentation factor: {avg_augmentation:.2f}x")
         print(f"Instructions with rephrases: {self.instructions_with_rephrases:,} ({rephrase_coverage:.1f}%)")
-        print(f"Data expansion: {((self.total_variants / self.episode_count) - 1) * 100:.1f}% more training data")
+        print(f"Data expansion: {((avg_augmentation) - 1) * 100:.1f}% more training data")
         print(f"="*60 + "\n")
         
         # Log final summary to wandb
         if WANDB_AVAILABLE:
             wandb.log({
-                "augmentation_summary/total_original_episodes": self.episode_count,
+                "augmentation_summary/total_episodes_encountered": self.episode_count,
+                "augmentation_summary/episodes_skipped_empty": self.skipped_empty_instructions,
+                "augmentation_summary/episodes_processed": processed_episodes,
                 "augmentation_summary/total_training_samples": self.total_variants,
                 "augmentation_summary/final_augmentation_factor": avg_augmentation,
                 "augmentation_summary/final_rephrase_coverage": rephrase_coverage,
@@ -182,78 +222,106 @@ class AugmentedRLDSDataset(IterableDataset):
             })
     
     def __iter__(self):
-        """Iterate over the dataset with instruction augmentation."""
-        for batch in self.base_dataset:
+        """Iterate over raw RLDS data and apply instruction augmentation before batch transform."""
+        print(f"[DEBUG] Starting augmented dataset iteration")
+        
+        # Iterate over raw RLDS data (before batch transform)
+        for rlds_batch in self.base_dataset.dataset.as_numpy_iterator():
             self.episode_count += 1
             
-            if self.instruction_augmenter and "task" in batch and "language_instruction" in batch["task"]:
-                # Decode the original instruction
-                original_instruction = batch["task"]["language_instruction"].decode()
+            # Check if we can apply augmentation
+            if (self.instruction_augmenter and 
+                "task" in rlds_batch and 
+                "language_instruction" in rlds_batch["task"]):
+                
+                # Get original instruction
+                original_instruction = rlds_batch["task"]["language_instruction"].decode().strip()
+                
+                # Skip episodes with empty instructions
+                if not original_instruction:
+                    self.skipped_empty_instructions += 1
+                    if self.episode_count <= 10:
+                        print(f"[DEBUG] Episode {self.episode_count}: Skipping empty instruction")
+                    continue
+                
+                # Debug output for first few batches
+                if self.episode_count <= 3:
+                    print(f"[DEBUG] Episode {self.episode_count}: Processing instruction: '{original_instruction}'")
                 
                 # Get all instruction variants
                 instruction_variants = self.instruction_augmenter.get_all_instruction_variants(original_instruction)
                 
+                if self.episode_count <= 3:
+                    print(f"[DEBUG] Episode {self.episode_count}: Generated {len(instruction_variants)} variants")
+                    for i, variant in enumerate(instruction_variants):
+                        print(f"[DEBUG]   Variant {i+1}: '{variant}'")
+                
                 # Update statistics
                 self.total_variants += len(instruction_variants)
-                if len(instruction_variants) > 1:  # More than just the original
+                if len(instruction_variants) > 1:
                     self.instructions_with_rephrases += 1
                 
-                # Log augmentation info periodically
+                # Log periodically
                 if self.episode_count % self.log_interval == 0:
-                    avg_augmentation = self.total_variants / self.episode_count if self.episode_count > 0 else 0
-                    rephrase_coverage = (self.instructions_with_rephrases / self.episode_count) * 100
+                    processed_episodes = self.episode_count - self.skipped_empty_instructions
+                    avg_augmentation = self.total_variants / processed_episodes if processed_episodes > 0 else 0
+                    rephrase_coverage = (self.instructions_with_rephrases / processed_episodes) * 100 if processed_episodes > 0 else 0
                     print(f"[Augmentation] Episode {self.episode_count}: "
                           f"'{original_instruction[:50]}...' -> {len(instruction_variants)} variants "
-                          f"(avg {avg_augmentation:.1f}x, {rephrase_coverage:.1f}% have rephrases)")
+                          f"(avg {avg_augmentation:.1f}x, {rephrase_coverage:.1f}% have rephrases, "
+                          f"skipped {self.skipped_empty_instructions} empty)")
                 
-                # Log to wandb periodically
-                if WANDB_AVAILABLE and self.episode_count % self.wandb_log_interval == 0:
-                    avg_augmentation = self.total_variants / self.episode_count
-                    rephrase_coverage = (self.instructions_with_rephrases / self.episode_count) * 100
+                # Create one processed batch for each variant
+                for variant in instruction_variants:
+                    # Create a copy of the raw RLDS batch with variant instruction
+                    augmented_rlds_batch = rlds_batch.copy()
+                    augmented_rlds_batch["task"] = rlds_batch["task"].copy()
+                    augmented_rlds_batch["task"]["language_instruction"] = variant.encode()
                     
-                    wandb.log({
-                        "augmentation/episodes_processed": self.episode_count,
-                        "augmentation/total_training_samples": self.total_variants,
-                        "augmentation/avg_augmentation_factor": avg_augmentation,
-                        "augmentation/rephrase_coverage_percent": rephrase_coverage,
-                        "augmentation/instructions_with_rephrases": self.instructions_with_rephrases,
-                        "augmentation/current_variants": len(instruction_variants)
-                    })
-                
-                # Yield one batch for each instruction variant
-                for i, variant in enumerate(instruction_variants):
-                    # Create a copy of the batch with the variant instruction
-                    augmented_batch = batch.copy()
-                    augmented_batch["task"] = batch["task"].copy()
-                    augmented_batch["task"]["language_instruction"] = variant.encode()
+                    # Apply batch transform to get processed batch
+                    processed_batch = self.base_dataset.batch_transform(augmented_rlds_batch)
+                    yield processed_batch
                     
                     self.augmented_episode_count += 1
-                    
-                    # Log first few variants for verification
-                    if self.episode_count <= 5:
-                        print(f"  Variant {i+1}/{len(instruction_variants)}: '{variant}'")
-                    
-                    yield augmented_batch
             else:
-                # No augmentation, yield original batch
+                # Check if instruction exists and is not empty (for non-augmented case)
+                if ("task" in rlds_batch and 
+                    "language_instruction" in rlds_batch["task"]):
+                    instruction = rlds_batch["task"]["language_instruction"].decode().strip()
+                    if not instruction:
+                        self.skipped_empty_instructions += 1
+                        if self.episode_count <= 10:
+                            print(f"[DEBUG] Episode {self.episode_count}: Skipping empty instruction (no augmentation)")
+                        continue
+                
+                # No augmentation, just apply batch transform
+                if self.episode_count <= 3:
+                    print(f"[DEBUG] Episode {self.episode_count}: No augmentation - applying base transform")
+                    print(f"[DEBUG] Episode {self.episode_count}: RLDS keys = {list(rlds_batch.keys())}")
+                    if "task" in rlds_batch:
+                        print(f"[DEBUG] Episode {self.episode_count}: Task keys = {list(rlds_batch['task'].keys())}")
+                
+                processed_batch = self.base_dataset.batch_transform(rlds_batch)
+                yield processed_batch
+                
                 self.augmented_episode_count += 1
-                self.total_variants += 1  # Count original as 1 variant
-                yield batch
+                self.total_variants += 1
 
 
 class AugmentedRLDSBatchTransform:
-    """Extended RLDSBatchTransform that works with augmented datasets."""
+    """RLDSBatchTransform that applies instruction augmentation to raw RLDS data."""
     
     def __init__(self, action_tokenizer, base_tokenizer, image_transform, prompt_builder_fn, 
-                 predict_stop_token: bool = True):
+                 instruction_augmenter: Optional[InstructionAugmenter] = None, predict_stop_token: bool = True):
         """
-        Initialize the batch transform.
+        Initialize the augmented batch transform.
         
         Args:
             action_tokenizer: Tokenizer for actions
             base_tokenizer: Base tokenizer for text
             image_transform: Transform for images
             prompt_builder_fn: Function to build prompts
+            instruction_augmenter: Optional instruction augmenter
             predict_stop_token: Whether to predict stop tokens
         """
         # Import here to avoid circular imports
@@ -267,16 +335,60 @@ class AugmentedRLDSBatchTransform:
             prompt_builder_fn=prompt_builder_fn,
             predict_stop_token=predict_stop_token
         )
+        self.instruction_augmenter = instruction_augmenter
+        self.batch_count = 0
     
-    def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
+    def __call__(self, rlds_batch: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Transform RLDS batch (instructions are already augmented at dataset level).
+        Transform RLDS batch with instruction augmentation.
         
         Args:
-            rlds_batch: Raw RLDS batch with potentially augmented instruction
+            rlds_batch: Raw RLDS batch
             
         Returns:
-            Transformed batch ready for model training
+            List of transformed batches (one for each instruction variant)
         """
-        # Apply the base transform (instructions are already processed by AugmentedRLDSDataset)
-        return self.base_transform(rlds_batch)
+        self.batch_count += 1
+        
+        # Check if we have instruction augmentation and the required structure
+        if (self.instruction_augmenter and 
+            "task" in rlds_batch and 
+            "language_instruction" in rlds_batch["task"]):
+            
+            # Get original instruction
+            original_instruction = rlds_batch["task"]["language_instruction"].decode()
+            
+            # Debug output for first few batches
+            if self.batch_count <= 3:
+                print(f"[DEBUG] Batch {self.batch_count}: Processing instruction: '{original_instruction}'")
+            
+            # Get all instruction variants
+            instruction_variants = self.instruction_augmenter.get_all_instruction_variants(original_instruction)
+            
+            if self.batch_count <= 3:
+                print(f"[DEBUG] Batch {self.batch_count}: Generated {len(instruction_variants)} variants")
+                for i, variant in enumerate(instruction_variants):
+                    print(f"[DEBUG]   Variant {i+1}: '{variant}'")
+            
+            # Create one batch for each variant
+            augmented_batches = []
+            for variant in instruction_variants:
+                # Create a copy of the batch with the variant instruction
+                augmented_batch = rlds_batch.copy()
+                augmented_batch["task"] = rlds_batch["task"].copy()
+                augmented_batch["task"]["language_instruction"] = variant.encode()
+                
+                # Apply base transform to get the final processed batch
+                processed_batch = self.base_transform(augmented_batch)
+                augmented_batches.append(processed_batch)
+            
+            return augmented_batches
+        else:
+            # No augmentation, just apply base transform
+            if self.batch_count <= 3:
+                print(f"[DEBUG] Batch {self.batch_count}: No augmentation applied")
+                print(f"[DEBUG] Batch {self.batch_count}: Keys = {list(rlds_batch.keys())}")
+                if "task" in rlds_batch:
+                    print(f"[DEBUG] Batch {self.batch_count}: Task keys = {list(rlds_batch['task'].keys())}")
+            
+            return [self.base_transform(rlds_batch)]
