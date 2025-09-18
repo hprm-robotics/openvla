@@ -107,6 +107,7 @@ class FinetuneConfig:
     lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
     use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
                                                                     #   => CAUTION: Reduces memory but hurts performance
+    skip_lora_merge_during_training: bool = True                   # Skip LoRA merging during training to save memory
 
     # Tracking Parameters
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
@@ -369,31 +370,44 @@ def finetune(cfg: FinetuneConfig) -> None:
 
                 # Merge LoRA weights into model backbone for faster inference
                 #   =>> Note that merging is slow and can be done post-hoc to speed up training
-                if cfg.use_lora:
-                    base_vla = AutoModelForVision2Seq.from_pretrained(
-                        cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
-                    )
-                    merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-                    merged_vla = merged_vla.merge_and_unload()
+                if cfg.use_lora and not cfg.skip_lora_merge_during_training:
+                    try:
+                        base_vla = AutoModelForVision2Seq.from_pretrained(
+                            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+                        )
+                        merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
+                        merged_vla = merged_vla.merge_and_unload()
+                        if distributed_state.is_main_process:
+                            if cfg.save_latest_checkpoint_only:
+                                # Overwrite latest checkpoint
+                                merged_vla.save_pretrained(run_dir)
+
+                                print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
+                            else:
+                                # Prepare to save checkpoint in new directory
+                                checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
+                                os.makedirs(checkpoint_dir, exist_ok=True)
+
+                                # Save dataset statistics to new directory
+                                save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
+
+                                # Save processor and model weights to new directory
+                                processor.save_pretrained(checkpoint_dir)
+                                merged_vla.save_pretrained(checkpoint_dir)
+
+                                print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
+                        
+                        # Clean up to free memory
+                        del base_vla, merged_vla
+                        torch.cuda.empty_cache()
+                        
+                    except torch.cuda.OutOfMemoryError:
+                        print(f"Warning: CUDA OOM during LoRA merging at step {gradient_step_idx}. Skipping merge.")
+                        print("Consider using --skip_lora_merge_during_training True for future runs.")
+                elif cfg.use_lora and cfg.skip_lora_merge_during_training:
                     if distributed_state.is_main_process:
-                        if cfg.save_latest_checkpoint_only:
-                            # Overwrite latest checkpoint
-                            merged_vla.save_pretrained(run_dir)
-
-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {run_dir}")
-                        else:
-                            # Prepare to save checkpoint in new directory
-                            checkpoint_dir = Path(str(run_dir) + f"--{gradient_step_idx}_chkpt")
-                            os.makedirs(checkpoint_dir, exist_ok=True)
-
-                            # Save dataset statistics to new directory
-                            save_dataset_statistics(vla_dataset.dataset_statistics, checkpoint_dir)
-
-                            # Save processor and model weights to new directory
-                            processor.save_pretrained(checkpoint_dir)
-                            merged_vla.save_pretrained(checkpoint_dir)
-
-                            print(f"Saved Model Checkpoint for Step {gradient_step_idx} at: {checkpoint_dir}")
+                        print(f"Saved LoRA Adapter Checkpoint for Step {gradient_step_idx} at: {adapter_dir}")
+                        print("Note: LoRA merging skipped during training. Use merge script post-training if needed.")
 
                 # Block on Main Process Checkpointing
                 dist.barrier()
