@@ -9,6 +9,8 @@ import random
 import re
 from typing import Any, Dict, List, Optional
 
+from torch.utils.data import IterableDataset
+
 
 def normalize_instruction(instr):
     """
@@ -118,7 +120,7 @@ class InstructionAugmenter:
         return random.choice(variants)
 
 
-class AugmentedRLDSDataset:
+class AugmentedRLDSDataset(IterableDataset):
     """
     Wrapper around RLDSDataset that replicates episodes for each instruction variant.
     This creates multiple training samples from each episode - one for each instruction rephrase.
@@ -132,6 +134,7 @@ class AugmentedRLDSDataset:
             base_dataset: The base RLDSDataset instance
             instruction_augmenter: Optional instruction augmenter for episode replication
         """
+        super().__init__()
         self.base_dataset = base_dataset
         self.instruction_augmenter = instruction_augmenter
         self.dataset_statistics = base_dataset.dataset_statistics
