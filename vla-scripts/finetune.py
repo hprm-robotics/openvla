@@ -19,6 +19,7 @@ Run with:
                                     ...
 """
 
+import json
 import os
 from collections import deque
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV1
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
+from prismatic.vla.datasets.instruction_augmentation import InstructionAugmenter, AugmentedRLDSDataset, AugmentedRLDSBatchTransform
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
@@ -82,6 +84,10 @@ class FinetuneConfig:
     dataset_name: str = "droid_wipe"                                # Name of fine-tuning dataset (e.g., `droid_wipe`)
     run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
     adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
+
+    # Instruction Augmentation Parameters
+    instruction_mapping_file: Optional[str] = None                  # Path to instruction mapping JSON file for augmentation
+    max_rephrases: int = 5                                          # Maximum number of rephrases to use per instruction
 
     # Fine-tuning Parameters
     batch_size: int = 16                                            # Fine-tuning batch size
@@ -130,6 +136,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
     if cfg.use_quantization:
         exp_id += "+q-4bit"
+    if cfg.instruction_mapping_file:
+        exp_id += f"+inst_aug-{cfg.max_rephrases}"
     if cfg.run_id_note is not None:
         exp_id += f"--{cfg.run_id_note}"
     if cfg.image_aug:
@@ -206,13 +214,35 @@ def finetune(cfg: FinetuneConfig) -> None:
     #     prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
     # )
     # ---
-    batch_transform = RLDSBatchTransform(
-        action_tokenizer,
-        processor.tokenizer,
-        image_transform=processor.image_processor.apply_transform,
-        prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-    )
-    vla_dataset = RLDSDataset(
+    
+    # Initialize instruction augmenter if mapping file is provided
+    instruction_augmenter = None
+    if cfg.instruction_mapping_file:
+        instruction_augmenter = InstructionAugmenter(
+            instruction_mapping_file=cfg.instruction_mapping_file,
+            max_rephrases=cfg.max_rephrases
+        )
+        print(f"Using instruction augmentation with mapping file: {cfg.instruction_mapping_file}")
+        print(f"Maximum rephrases per instruction: {cfg.max_rephrases}")
+    
+    # Create batch transform (same for both augmented and non-augmented)
+    if instruction_augmenter:
+        batch_transform = AugmentedRLDSBatchTransform(
+            action_tokenizer=action_tokenizer,
+            base_tokenizer=processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+        )
+    else:
+        batch_transform = RLDSBatchTransform(
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+        )
+    
+    # Create base dataset
+    base_dataset = RLDSDataset(
         cfg.data_root_dir,
         cfg.dataset_name,
         batch_transform,
@@ -220,6 +250,13 @@ def finetune(cfg: FinetuneConfig) -> None:
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
     )
+    
+    # Wrap with augmented dataset if instruction augmenter is provided
+    if instruction_augmenter:
+        vla_dataset = AugmentedRLDSDataset(base_dataset, instruction_augmenter)
+        print(f"Dataset will be augmented - each episode will be replicated up to {cfg.max_rephrases + 1} times")
+    else:
+        vla_dataset = base_dataset
 
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     if distributed_state.is_main_process:
